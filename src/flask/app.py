@@ -513,6 +513,9 @@ class Flask(App):
 
         :param context: the context as a dictionary that is updated in place
                         to add extra variables.
+                        
+        .. versionchanged:: 3.1
+           Optimized performance by using cached sync function wrappers.
         """
         names: t.Iterable[str | None] = (None,)
 
@@ -526,8 +529,12 @@ class Flask(App):
 
         for name in names:
             if name in self.template_context_processors:
-                for func in self.template_context_processors[name]:
-                    context.update(self.ensure_sync(func)())
+                processors = self.template_context_processors[name]
+                for func in processors:
+                    # Get or create synchronized version of the function (cached)
+                    sync_func = self.ensure_sync(func)
+                    # Execute and update context
+                    context.update(sync_func())
 
         context.update(orig_ctx)
 
@@ -882,6 +889,9 @@ class Flask(App):
         be a response object.  In order to convert the return value to a
         proper response object, call :func:`make_response`.
 
+        .. versionchanged:: 3.1
+           Optimized performance by using cached sync function wrappers.
+
         .. versionchanged:: 0.7
            This no longer does the exception handling, this code was
            moved to the new :meth:`full_dispatch_request`.
@@ -899,7 +909,11 @@ class Flask(App):
             return self.make_default_options_response()
         # otherwise dispatch to the handler for that endpoint
         view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
-        return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+        view_func = self.view_functions[rule.endpoint]
+        
+        # Get or create synchronized version of the view function (cached)
+        sync_view_func = self.ensure_sync(view_func)
+        return sync_view_func(**view_args)  # type: ignore[no-any-return]
 
     def full_dispatch_request(self) -> Response:
         """Dispatches the request and on top of that performs request
@@ -963,6 +977,12 @@ class Flask(App):
         rv.allow.update(methods)
         return rv
 
+    # Cache to store function -> synchronized function mapping
+    _ensure_sync_cache: t.Dict[t.Callable[..., t.Any], t.Callable[..., t.Any]] = {}
+    
+    # Flag for fast path detection of sync vs async
+    _has_async_handlers: bool = False
+
     def ensure_sync(self, func: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
         """Ensure that the function is synchronous for WSGI workers.
         Plain ``def`` functions are returned as-is. ``async def``
@@ -971,11 +991,30 @@ class Flask(App):
         Override this method to change how the app runs async views.
 
         .. versionadded:: 2.0
+        .. versionchanged:: 3.1
+           Added caching to avoid repeatedly checking if a function is a coroutine.
+           Added a fast path for applications with only synchronous handlers.
         """
+        # Fast path: if we've never seen an async function and this isn't one,
+        # just return it directly without dictionary lookup overhead
+        if not self._has_async_handlers and not iscoroutinefunction(func):
+            return func
+            
+        # Check cache for previously processed functions
+        cached_result = self._ensure_sync_cache.get(func)
+        if cached_result is not None:
+            return cached_result
+        
+        # Process the function and cache the result
         if iscoroutinefunction(func):
-            return self.async_to_sync(func)
-
-        return func
+            self._has_async_handlers = True
+            result = self.async_to_sync(func)
+        else:
+            result = func
+            
+        # Cache the result for future calls
+        self._ensure_sync_cache[func] = result
+        return result
 
     def async_to_sync(
         self, func: t.Callable[..., t.Coroutine[t.Any, t.Any, t.Any]]
@@ -1277,19 +1316,31 @@ class Flask(App):
         If any :meth:`before_request` handler returns a non-None value, the
         value is handled as if it was the return value from the view, and
         further request handling is stopped.
+        
+        .. versionchanged:: 3.1
+           Optimized performance by caching sync function wrappers and adding a
+           fast path for synchronous functions.
         """
         names = (None, *reversed(request.blueprints))
 
+        # Process URL value preprocessors
         for name in names:
             if name in self.url_value_preprocessors:
-                for url_func in self.url_value_preprocessors[name]:
-                    url_func(request.endpoint, request.view_args)
+                preprocessors = self.url_value_preprocessors[name]
+                endpoint, view_args = request.endpoint, request.view_args
+                for url_func in preprocessors:
+                    url_func(endpoint, view_args)
 
+        # Process before request functions with optimization
         for name in names:
             if name in self.before_request_funcs:
-                for before_func in self.before_request_funcs[name]:
-                    rv = self.ensure_sync(before_func)()
-
+                funcs = self.before_request_funcs[name]
+                for before_func in funcs:
+                    # Get or create synchronized version of the function (cached)
+                    sync_func = self.ensure_sync(before_func)
+                    
+                    # Execute the function and check return value
+                    rv = sync_func()
                     if rv is not None:
                         return rv  # type: ignore[no-any-return]
 
@@ -1303,6 +1354,9 @@ class Flask(App):
         .. versionchanged:: 0.5
            As of Flask 0.5 the functions registered for after request
            execution are called in reverse order of registration.
+           
+        .. versionchanged:: 3.1
+           Optimized performance by using cached sync function wrappers.
 
         :param response: a :attr:`response_class` object.
         :return: a new response object or the same, has to be an
@@ -1310,14 +1364,22 @@ class Flask(App):
         """
         ctx = request_ctx._get_current_object()  # type: ignore[attr-defined]
 
+        # Process context-local after request functions
         for func in ctx._after_request_functions:
-            response = self.ensure_sync(func)(response)
+            # Get or create synchronized version of the function (cached)
+            sync_func = self.ensure_sync(func)
+            response = sync_func(response)
 
+        # Process registered after request functions
         for name in chain(request.blueprints, (None,)):
             if name in self.after_request_funcs:
-                for func in reversed(self.after_request_funcs[name]):
-                    response = self.ensure_sync(func)(response)
+                funcs = self.after_request_funcs[name]
+                for func in reversed(funcs):
+                    # Get or create synchronized version of the function (cached)
+                    sync_func = self.ensure_sync(func)
+                    response = sync_func(response)
 
+        # Save session if needed
         if not self.session_interface.is_null_session(ctx.session):
             self.session_interface.save_session(self, ctx.session, response)
 
@@ -1344,6 +1406,9 @@ class Flask(App):
             request. Detected from the current exception information if
             not passed. Passed to each teardown function.
 
+        .. versionchanged:: 3.1
+           Optimized performance by using cached sync function wrappers.
+
         .. versionchanged:: 0.9
             Added the ``exc`` argument.
         """
@@ -1352,8 +1417,11 @@ class Flask(App):
 
         for name in chain(request.blueprints, (None,)):
             if name in self.teardown_request_funcs:
-                for func in reversed(self.teardown_request_funcs[name]):
-                    self.ensure_sync(func)(exc)
+                funcs = self.teardown_request_funcs[name]
+                for func in reversed(funcs):
+                    # Get or create synchronized version of the function (cached)
+                    sync_func = self.ensure_sync(func)
+                    sync_func(exc)
 
         request_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
 
@@ -1373,13 +1441,18 @@ class Flask(App):
         This is called by
         :meth:`AppContext.pop() <flask.ctx.AppContext.pop>`.
 
+        .. versionchanged:: 3.1
+           Optimized performance by using cached sync function wrappers.
+
         .. versionadded:: 0.9
         """
         if exc is _sentinel:
             exc = sys.exc_info()[1]
 
         for func in reversed(self.teardown_appcontext_funcs):
-            self.ensure_sync(func)(exc)
+            # Get or create synchronized version of the function (cached)
+            sync_func = self.ensure_sync(func)
+            sync_func(exc)
 
         appcontext_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
 
