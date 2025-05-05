@@ -876,6 +876,10 @@ class Flask(App):
             f"Exception on {request.path} [{request.method}]", exc_info=exc_info
         )
 
+    # Cache for ensure_sync results to avoid repeated wrapping of the same function
+    _ensure_sync_cache: dict[t.Callable[..., t.Any], t.Callable[..., t.Any]] = {}
+    
+    
     def dispatch_request(self) -> ft.ResponseReturnValue:
         """Does the request dispatching.  Matches the URL and returns the
         return value of the view or error handler.  This does not have to
@@ -889,7 +893,9 @@ class Flask(App):
         req = request_ctx.request
         if req.routing_exception is not None:
             self.raise_routing_exception(req)
+        
         rule: Rule = req.url_rule  # type: ignore[assignment]
+        
         # if we provide automatic options for this URL and the
         # request came with the OPTIONS method, reply automatically
         if (
@@ -897,9 +903,25 @@ class Flask(App):
             and req.method == "OPTIONS"
         ):
             return self.make_default_options_response()
+        
         # otherwise dispatch to the handler for that endpoint
+        endpoint = rule.endpoint
+        view_func = self.view_functions[endpoint]
+        
+        # Use the cache for ensure_sync to avoid repeated wrapping
+        if view_func in self._ensure_sync_cache:
+            view_func = self._ensure_sync_cache[view_func]
+        else:
+            # Cache the result of ensure_sync
+            sync_func = self.ensure_sync(view_func)
+            self._ensure_sync_cache[view_func] = sync_func
+            view_func = sync_func
+        
+        # Get view arguments
         view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
-        return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+        
+        # Call the view function with unpacked arguments
+        return view_func(**view_args)  # type: ignore[no-any-return]
 
     def full_dispatch_request(self) -> Response:
         """Dispatches the request and on top of that performs request
@@ -962,6 +984,9 @@ class Flask(App):
         rv = self.response_class()
         rv.allow.update(methods)
         return rv
+
+    # Cache for ensure_sync results to avoid repeated wrapping of the same function
+    _ensure_sync_cache: dict[t.Callable[..., t.Any], t.Callable[..., t.Any]] = {}
 
     def ensure_sync(self, func: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
         """Ensure that the function is synchronous for WSGI workers.
@@ -1403,6 +1428,7 @@ class Flask(App):
         .. versionadded:: 0.9
         """
         return AppContext(self)
+        
 
     def request_context(self, environ: WSGIEnvironment) -> RequestContext:
         """Create a :class:`~flask.ctx.RequestContext` representing a
