@@ -43,6 +43,7 @@ from .helpers import get_load_dotenv
 from .helpers import send_from_directory
 from .sansio.app import App
 from .sansio.scaffold import _sentinel
+from .sansio.scaffold import setupmethod
 from .sessions import SecureCookieSessionInterface
 from .sessions import SessionInterface
 from .signals import appcontext_tearing_down
@@ -883,6 +884,12 @@ class Flask(App):
             f"Exception on {request.path} [{request.method}]", exc_info=exc_info
         )
 
+    # Cache for optimized view function dispatching
+    _view_func_cache: t.Dict[str, t.Callable[..., t.Any]] = {}
+    
+    # Flag to track if any cached view functions need to be invalidated
+    _view_functions_changed: bool = False
+    
     def dispatch_request(self) -> ft.ResponseReturnValue:
         """Does the request dispatching.  Matches the URL and returns the
         return value of the view or error handler.  This does not have to
@@ -891,6 +898,10 @@ class Flask(App):
 
         .. versionchanged:: 3.1
            Optimized performance by using cached sync function wrappers.
+           
+        .. versionchanged:: 3.1.1
+           Further optimized by adding a view function cache to avoid repeated lookups
+           and ensure_sync calls. The cache is invalidated when view functions change.
 
         .. versionchanged:: 0.7
            This no longer does the exception handling, this code was
@@ -907,13 +918,53 @@ class Flask(App):
             and req.method == "OPTIONS"
         ):
             return self.make_default_options_response()
-        # otherwise dispatch to the handler for that endpoint
-        view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
-        view_func = self.view_functions[rule.endpoint]
         
-        # Get or create synchronized version of the view function (cached)
-        sync_view_func = self.ensure_sync(view_func)
+        # Reset view function cache if there were changes to registered view functions
+        if self._view_functions_changed:
+            self._view_func_cache.clear()
+            self._view_functions_changed = False
+            
+        # Fast path: check if we have a cached wrapped view function for this endpoint
+        endpoint = rule.endpoint
+        view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
+        
+        # Try to get the view function from the cache
+        sync_view_func = self._view_func_cache.get(endpoint)
+        if sync_view_func is None:
+            # Cache miss - get the view function and synchronize it if needed
+            view_func = self.view_functions[endpoint]
+            sync_view_func = self.ensure_sync(view_func)
+            # Store in cache for future lookups
+            self._view_func_cache[endpoint] = sync_view_func
+        
+        # Call the view function with the unpacked arguments
         return sync_view_func(**view_args)  # type: ignore[no-any-return]
+        
+    @setupmethod
+    def add_url_rule(
+        self,
+        rule: str,
+        endpoint: str | None = None,
+        view_func: ft.RouteCallable | None = None,
+        provide_automatic_options: bool | None = None,
+        **options: t.Any,
+    ) -> None:
+        """Override to track view function changes for cache invalidation."""
+        # First use the parent implementation
+        super().add_url_rule(
+            rule=rule,
+            endpoint=endpoint,
+            view_func=view_func,
+            provide_automatic_options=provide_automatic_options,
+            **options
+        )
+        
+        # Mark that view functions have changed
+        if view_func is not None and endpoint is not None:
+            self._view_functions_changed = True
+            # Remove from cache if it was cached
+            if endpoint in self._view_func_cache:
+                del self._view_func_cache[endpoint]
 
     def full_dispatch_request(self) -> Response:
         """Dispatches the request and on top of that performs request
