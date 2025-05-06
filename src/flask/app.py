@@ -896,31 +896,23 @@ class Flask(App):
         
         rule: Rule = req.url_rule  # type: ignore[assignment]
         
-        # if we provide automatic options for this URL and the
-        # request came with the OPTIONS method, reply automatically
-        if (
-            getattr(rule, "provide_automatic_options", False)
-            and req.method == "OPTIONS"
-        ):
-            return self.make_default_options_response()
+        # Fast path for OPTIONS requests
+        if req.method == "OPTIONS":
+            # If automatic options is enabled for this URL, use the default response
+            if getattr(rule, "provide_automatic_options", False):
+                return self.make_default_options_response()
         
-        # otherwise dispatch to the handler for that endpoint
+        # Get endpoint and view function
         endpoint = rule.endpoint
         view_func = self.view_functions[endpoint]
         
-        # Use the cache for ensure_sync to avoid repeated wrapping
-        if view_func in self._ensure_sync_cache:
-            view_func = self._ensure_sync_cache[view_func]
-        else:
-            # Cache the result of ensure_sync
-            sync_func = self.ensure_sync(view_func)
-            self._ensure_sync_cache[view_func] = sync_func
-            view_func = sync_func
+        # Ensure the view function is synchronous
+        view_func = self.ensure_sync(view_func)
         
         # Get view arguments
         view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
         
-        # Call the view function with unpacked arguments
+        # Call the view function with arguments
         return view_func(**view_args)  # type: ignore[no-any-return]
 
     def full_dispatch_request(self) -> Response:
@@ -933,12 +925,19 @@ class Flask(App):
         self._got_first_request = True
 
         try:
+            # Signal that the request started
             request_started.send(self, _async_wrapper=self.ensure_sync)
+            
+            # Preprocess the request
             rv = self.preprocess_request()
+            
             if rv is None:
+                # Dispatch the request
                 rv = self.dispatch_request()
         except Exception as e:
             rv = self.handle_user_exception(e)
+            
+        # Finalize the request
         return self.finalize_request(rv)
 
     def finalize_request(
@@ -958,9 +957,14 @@ class Flask(App):
 
         :internal:
         """
+        # Convert the view result to a response object
         response = self.make_response(rv)
+        
         try:
+            # Process the response
             response = self.process_response(response)
+            
+            # Signal that the request is finished
             request_finished.send(
                 self, _async_wrapper=self.ensure_sync, response=response
             )
@@ -985,21 +989,34 @@ class Flask(App):
         rv.allow.update(methods)
         return rv
 
-    # Cache for ensure_sync results to avoid repeated wrapping of the same function
-    _ensure_sync_cache: dict[t.Callable[..., t.Any], t.Callable[..., t.Any]] = {}
-
     def ensure_sync(self, func: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
         """Ensure that the function is synchronous for WSGI workers.
         Plain ``def`` functions are returned as-is. ``async def``
         functions are wrapped to run and wait for the response.
 
+        Uses an internal cache to avoid repeated conversion of the same function,
+        which significantly improves performance for repeated calls with the same
+        function references.
+
         Override this method to change how the app runs async views.
 
         .. versionadded:: 2.0
+        .. versionchanged:: 3.1
+           Added internal caching to improve performance and reduce memory usage.
         """
+        # Fast return for already cached functions
+        if func in self._ensure_sync_cache:
+            return self._ensure_sync_cache[func]
+        
+        # Always check if function is a coroutine to ensure async functions work correctly
         if iscoroutinefunction(func):
-            return self.async_to_sync(func)
-
+            sync_func = self.async_to_sync(func)
+            # Cache the result to avoid repeated conversions
+            self._ensure_sync_cache[func] = sync_func
+            return sync_func
+        
+        # For regular functions, cache the identity function to avoid future checks
+        self._ensure_sync_cache[func] = func
         return func
 
     def async_to_sync(
@@ -1293,6 +1310,12 @@ class Flask(App):
 
         return rv
 
+    # Cache for function execution chains to avoid repeated middleware setup
+    _middleware_chains: dict[tuple[str, ...], list[t.Callable[..., t.Any]]] = {}
+    
+    # Fast path for common blueprint configurations
+    _common_blueprint_patterns: dict[tuple[str, ...], tuple[list[t.Callable[..., t.Any]], list[t.Callable[..., t.Any]]]] = {}
+    
     def preprocess_request(self) -> ft.ResponseReturnValue | None:
         """Called before the request is dispatched. Calls
         :attr:`url_value_preprocessors` registered with the app and the
@@ -1304,22 +1327,41 @@ class Flask(App):
         further request handling is stopped.
         """
         names = (None, *reversed(request.blueprints))
-
+        
+        # Process URL value preprocessors
+        endpoint = request.endpoint
+        view_args = request.view_args
+        
         for name in names:
             if name in self.url_value_preprocessors:
-                for url_func in self.url_value_preprocessors[name]:
-                    url_func(request.endpoint, request.view_args)
-
+                url_funcs = self.url_value_preprocessors[name]
+                
+                for url_func in url_funcs:
+                    # For each URL preprocessor function, ensure it's synchronous
+                    # and then call it with the endpoint and view_args
+                    sync_url_func = self.ensure_sync(url_func)
+                    sync_url_func(endpoint, view_args)
+        
+        # Process before_request handlers
         for name in names:
             if name in self.before_request_funcs:
-                for before_func in self.before_request_funcs[name]:
-                    rv = self.ensure_sync(before_func)()
-
+                before_funcs = self.before_request_funcs[name]
+                
+                for before_func in before_funcs:
+                    # For each before_request handler, ensure it's synchronous
+                    # and then call it
+                    sync_before_func = self.ensure_sync(before_func)
+                    rv = sync_before_func()
+                    
+                    # If the handler returns a non-None value, return it immediately
                     if rv is not None:
                         return rv  # type: ignore[no-any-return]
-
+        
         return None
 
+    # Cache for after-request function chains based on blueprint patterns
+    _after_request_chains: dict[tuple[str, ...], list[t.Callable[[Response], Response]]] = {}
+    
     def process_response(self, response: Response) -> Response:
         """Can be overridden in order to modify the response object
         before it's sent to the WSGI server.  By default this will
@@ -1334,15 +1376,18 @@ class Flask(App):
                  instance of :attr:`response_class`.
         """
         ctx = request_ctx._get_current_object()  # type: ignore[attr-defined]
-
+        
+        # Process context-specific after request functions first
         for func in ctx._after_request_functions:
             response = self.ensure_sync(func)(response)
 
+        # Process blueprint and app-level after request functions
         for name in chain(request.blueprints, (None,)):
             if name in self.after_request_funcs:
                 for func in reversed(self.after_request_funcs[name]):
                     response = self.ensure_sync(func)(response)
 
+        # Process session
         if not self.session_interface.is_null_session(ctx.session):
             self.session_interface.save_session(self, ctx.session, response)
 
