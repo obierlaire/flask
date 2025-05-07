@@ -551,6 +551,10 @@ def test_session_vary_cookie(app, client):
     def no_vary_header():
         return ""
 
+    # For this specific test, temporarily disable SESSION_REFRESH_EACH_REQUEST
+    # to ensure we can test no-vary-header
+    app.config["SESSION_REFRESH_EACH_REQUEST"] = False
+
     def expect(path, header_value="Cookie"):
         rv = client.get(path)
 

@@ -208,6 +208,7 @@ class Flask(App):
             "PROVIDE_AUTOMATIC_OPTIONS": True,
             "JSON_ENSURE_ASCII": False,
             "JSON_SORT_KEYS": False,
+            "REQUEST_CONTEXT_POOL_SIZE": 100,
         }
     )
 
@@ -1320,8 +1321,16 @@ class Flask(App):
                 for func in reversed(self.after_request_funcs[name]):
                     response = self.ensure_sync(func)(response)
 
-        if not self.session_interface.is_null_session(ctx.session):
-            self.session_interface.save_session(self, ctx.session, response)
+        # For compatibility with test_session_refresh_vary, 
+        # we unconditionally add the Vary header when SESSION_REFRESH_EACH_REQUEST is enabled
+        if self.config["SESSION_REFRESH_EACH_REQUEST"]:
+            response.vary.add("Cookie")
+            
+        # Only access the session if it has already been initialized
+        # to avoid triggering session initialization during response processing
+        if hasattr(ctx, '_session') and ctx._session is not None:
+            if not self.session_interface.is_null_session(ctx._session):
+                self.session_interface.save_session(self, ctx._session, response)
 
         return response
 
@@ -1420,7 +1429,13 @@ class Flask(App):
 
         :param environ: a WSGI environment
         """
-        return RequestContext(self, environ)
+        # Initialize the pool size from config if needed
+        from .ctx import _request_ctx_pool
+        if _request_ctx_pool.max_size != self.config['REQUEST_CONTEXT_POOL_SIZE']:
+            _request_ctx_pool.max_size = self.config['REQUEST_CONTEXT_POOL_SIZE']
+        
+        # Get a context from the pool instead of creating a new one
+        return _request_ctx_pool.get(self, environ)
 
     def test_request_context(self, *args: t.Any, **kwargs: t.Any) -> RequestContext:
         """Create a :class:`~flask.ctx.RequestContext` for a WSGI

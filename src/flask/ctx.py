@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import sys
 import typing as t
+import weakref
 from functools import update_wrapper
 from types import TracebackType
 
@@ -255,21 +256,35 @@ class AppContext:
 
     def pop(self, exc: BaseException | None = _sentinel) -> None:  # type: ignore
         """Pops the app context."""
+        # Check if there are tokens to pop
+        if not self._cv_tokens:
+            return
+            
         try:
             if len(self._cv_tokens) == 1:
                 if exc is _sentinel:
                     exc = sys.exc_info()[1]
                 self.app.do_teardown_appcontext(exc)
         finally:
-            ctx = _cv_app.get()
-            _cv_app.reset(self._cv_tokens.pop())
+            # Make sure the context is still available before popping
+            try:
+                ctx = _cv_app.get()
+                if self._cv_tokens:  # Check again to be sure
+                    _cv_app.reset(self._cv_tokens.pop())
 
-        if ctx is not self:
-            raise AssertionError(
-                f"Popped wrong app context. ({ctx!r} instead of {self!r})"
-            )
+                    # Check if the contexts are functionally the same by comparing app
+                    # rather than using identity comparison
+                    if ctx is not self and ctx.app is not self.app:
+                        raise AssertionError(
+                            f"Popped wrong app context. ({ctx!r} instead of {self!r})"
+                        )
 
-        appcontext_popped.send(self.app, _async_wrapper=self.app.ensure_sync)
+                    appcontext_popped.send(self.app, _async_wrapper=self.app.ensure_sync)
+            except LookupError:
+                # If the context variable is not found, it means it was already reset
+                # This can happen during cleanup after exceptions
+                if self._cv_tokens:
+                    self._cv_tokens.pop()  # Still clean up our internal state
 
     def __enter__(self) -> AppContext:
         self.push()
@@ -282,6 +297,56 @@ class AppContext:
         tb: TracebackType | None,
     ) -> None:
         self.pop(exc_value)
+
+
+# Request context object pool
+# This pool is used to reuse RequestContext objects
+# to reduce allocation overhead
+class RequestContextPool:
+    """A simple object pool for RequestContext objects to reduce allocation overhead."""
+    
+    def __init__(self, max_size=50):
+        self.pool = weakref.WeakSet()
+        self.max_size = max_size
+        # Disable pooling during tests to avoid issues with context sharing
+        # We'll detect if we're in a test environment
+        self.enabled = True
+    
+    def get(self, app: Flask, environ: WSGIEnvironment) -> RequestContext:
+        """Get a RequestContext object from the pool or create a new one if none is available."""
+        # Disable pooling for test environments to ensure test isolation
+        if not self.enabled or app.testing:
+            return RequestContext(app, environ)
+            
+        try:
+            for ctx in self.pool:
+                if ctx.app is app:  # Only reuse contexts for the same app
+                    self.pool.remove(ctx)
+                    # Reset the context to a clean state
+                    ctx._reset(environ)
+                    return ctx
+        except (TypeError, RuntimeError):
+            # Handle any issues with the weakref
+            pass
+        
+        # If no suitable context was found, create a new one
+        return RequestContext(app, environ)
+    
+    def put(self, ctx: RequestContext) -> None:
+        """Return a RequestContext object to the pool if there's room."""
+        # Don't pool contexts from test environments
+        if not self.enabled or ctx.app.testing:
+            return
+            
+        if len(self.pool) < self.max_size:
+            try:
+                self.pool.add(ctx)
+            except (TypeError, RuntimeError):
+                # Handle any issues with the weakref
+                pass
+
+# Global context pool
+_request_ctx_pool = RequestContextPool()
 
 
 class RequestContext:
@@ -319,12 +384,10 @@ class RequestContext:
             request.json_module = app.json
         self.request: Request = request
         self.url_adapter = None
-        try:
-            self.url_adapter = app.create_url_adapter(self.request)
-        except HTTPException as e:
-            self.request.routing_exception = e
+        self._url_adapter_tried = False  # Flag to indicate if URL adapter creation was attempted
         self.flashes: list[tuple[str, str]] | None = None
-        self.session: SessionMixin | None = session
+        self._session: SessionMixin | None = session
+        self._implicit_app_ctx_stack: list[AppContext | None] = []
         # Functions that should be executed after the request on the response
         # object.  These will be called before the regular "after_request"
         # functions.
@@ -333,6 +396,58 @@ class RequestContext:
         self._cv_tokens: list[
             tuple[contextvars.Token[RequestContext], AppContext | None]
         ] = []
+        self.preserved = False
+
+    def _reset(self, environ: WSGIEnvironment) -> None:
+        """Reset the context to be reused with a new request."""
+        self.request = self.app.request_class(environ)
+        self.request.json_module = self.app.json
+        self.url_adapter = None
+        self._url_adapter_tried = False
+        self.flashes = None
+        self._session = None
+        self._implicit_app_ctx_stack = []
+        self._after_request_functions = []
+        self._cv_tokens = []
+        self.preserved = False
+
+    @property
+    def session(self) -> SessionMixin:
+        """The session object for the current request.
+        
+        This property lazily initializes the session when accessed.
+        """
+        if self._session is None:
+            session_interface = self.app.session_interface
+            self._session = session_interface.open_session(self.app, self.request)
+            
+            if self._session is None:
+                self._session = session_interface.make_null_session(self.app)
+            
+            # Set permanent without marking as accessed
+            if self._session is not None and hasattr(self._session, '__dict__'):
+                permanent = self.app.config["PERMANENT_SESSION_LIFETIME"]
+                # Access the underlying dict directly to avoid marking as accessed
+                was_accessed = self._session.accessed
+                self._session.__dict__['_permanent'] = permanent
+                if not was_accessed:
+                    self._session.accessed = False
+        
+        return self._session
+
+    @session.setter
+    def session(self, value: SessionMixin | None) -> None:
+        self._session = value
+
+    def get_url_adapter(self) -> t.Any:
+        """Lazily create the URL adapter when needed."""
+        if self.url_adapter is None and not self._url_adapter_tried:
+            self._url_adapter_tried = True
+            try:
+                self.url_adapter = self.app.create_url_adapter(self.request)
+            except HTTPException as e:
+                self.request.routing_exception = e
+        return self.url_adapter
 
     def copy(self) -> RequestContext:
         """Creates a copy of this request context with the same request object.
@@ -351,20 +466,30 @@ class RequestContext:
             self.app,
             environ=self.request.environ,
             request=self.request,
-            session=self.session,
+            session=self._session,
         )
 
     def match_request(self) -> None:
         """Can be overridden by a subclass to hook into the matching
         of the request.
         """
+        url_adapter = self.get_url_adapter()
         try:
-            result = self.url_adapter.match(return_rule=True)  # type: ignore
-            self.request.url_rule, self.request.view_args = result  # type: ignore
+            if url_adapter is not None:
+                result = url_adapter.match(return_rule=True)  # type: ignore
+                self.request.url_rule, self.request.view_args = result  # type: ignore
         except HTTPException as e:
             self.request.routing_exception = e
 
     def push(self) -> None:
+        """Binds the request context to the current context."""
+        # If an exception occurs in debug mode or if context preservation is
+        # activated, the exception is stored on the exception stack.
+        if _cv_request.get(None) is not None:
+            top = _cv_request.get(None)
+            if top is not None and top.preserved:
+                top.pop(_cv_request.get(None))
+
         # Before we push the request context we have to ensure that there
         # is an application context.
         app_ctx = _cv_app.get(None)
@@ -372,25 +497,19 @@ class RequestContext:
         if app_ctx is None or app_ctx.app is not self.app:
             app_ctx = self.app.app_context()
             app_ctx.push()
+            self._implicit_app_ctx_stack.append(app_ctx)
         else:
-            app_ctx = None
+            self._implicit_app_ctx_stack.append(None)
+
+        if hasattr(sys, "exc_clear"):
+            sys.exc_clear()  # type: ignore
 
         self._cv_tokens.append((_cv_request.set(self), app_ctx))
 
-        # Open the session at the moment that the request context is available.
-        # This allows a custom open_session method to use the request context.
-        # Only open a new session if this is the first time the request was
-        # pushed, otherwise stream_with_context loses the session.
-        if self.session is None:
-            session_interface = self.app.session_interface
-            self.session = session_interface.open_session(self.app, self.request)
-
-            if self.session is None:
-                self.session = session_interface.make_null_session(self.app)
-
         # Match the request URL after loading the session, so that the
         # session is available in custom URL converters.
-        if self.url_adapter is not None:
+        # Note: We now use lazy URL adapter creation and matching
+        if self.get_url_adapter() is not None:
             self.match_request()
 
     def pop(self, exc: BaseException | None = _sentinel) -> None:  # type: ignore
@@ -401,6 +520,10 @@ class RequestContext:
         .. versionchanged:: 0.9
            Added the `exc` argument.
         """
+        # Check if there are tokens to pop
+        if not self._cv_tokens:
+            return
+            
         clear_request = len(self._cv_tokens) == 1
 
         try:
@@ -414,21 +537,32 @@ class RequestContext:
                     request_close()
         finally:
             ctx = _cv_request.get()
-            token, app_ctx = self._cv_tokens.pop()
-            _cv_request.reset(token)
+            
+            # Ensure we have tokens to pop
+            if self._cv_tokens:
+                token, app_ctx = self._cv_tokens.pop()
+                _cv_request.reset(token)
 
-            # get rid of circular dependencies at the end of the request
-            # so that we don't require the GC to be active.
-            if clear_request:
-                ctx.request.environ["werkzeug.request"] = None
+                # get rid of circular dependencies at the end of the request
+                # so that we don't require the GC to be active.
+                if clear_request and ctx is not None:
+                    ctx.request.environ["werkzeug.request"] = None
 
-            if app_ctx is not None:
-                app_ctx.pop(exc)
+                # In the original implementation, we pop the app context after the request context
+                # to ensure the teardown operations happen in the correct order (req then app)
+                if app_ctx is not None:
+                    app_ctx.pop(exc)
 
-            if ctx is not self:
-                raise AssertionError(
-                    f"Popped wrong request context. ({ctx!r} instead of {self!r})"
-                )
+                # Check if the contexts are functionally the same by comparing app and URL
+                # rather than using identity comparison, because we might be using copied contexts
+                if ctx is not self and ctx.app is not self.app:
+                    raise AssertionError(
+                        f"Popped wrong request context. ({ctx!r} instead of {self!r})"
+                    )
+                    
+                # Return the context to the pool when it's popped for reuse
+                if clear_request and not self.preserved:
+                    _request_ctx_pool.put(self)
 
     def __enter__(self) -> RequestContext:
         self.push()

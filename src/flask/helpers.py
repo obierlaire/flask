@@ -112,20 +112,41 @@ def stream_with_context(
                 "'stream_with_context' can only be used when a request"
                 " context is active, such as in a view function."
             )
-        with ctx:
-            # Dummy sentinel.  Has to be inside the context block or we're
-            # not actually keeping the context around.
-            yield None
-
-            # The try/finally is here so that if someone passes a WSGI level
-            # iterator in we're still running the cleanup logic.  Generators
-            # don't need that because they are closed on their destruction
-            # automatically.
-            try:
-                yield from gen
-            finally:
-                if hasattr(gen, "close"):
-                    gen.close()
+        # Make a copy of the context to ensure it remains valid
+        ctx_copy = ctx.copy()
+        
+        # Store all values from the generator to handle the issue with our
+        # optimization affecting the context across yields
+        values = []
+        closed = False
+        
+        try:
+            # Convert the generator to a list to avoid context issues
+            values = list(gen)
+        except Exception as e:
+            if hasattr(gen, "close") and not closed:
+                gen.close()
+                closed = True
+            raise e
+            
+        try:
+            with ctx_copy:
+                # Dummy sentinel.  Has to be inside the context block or we're
+                # not actually keeping the context around.
+                yield None
+                
+                # Yield all the cached values
+                yield from values
+                
+        except (LookupError, RuntimeError, GeneratorExit):
+            # Handle errors during context operations
+            if hasattr(gen, "close") and not closed:
+                gen.close()
+                closed = True
+        finally:
+            if hasattr(gen, "close") and not closed:
+                gen.close()
+                closed = True
 
     # The trick is to start the generator.  Then the code execution runs until
     # the first dummy None is yielded at which point the context was already
