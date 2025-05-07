@@ -385,6 +385,30 @@ The following configuration values are used internally by Flask:
     ``4093``. Larger cookies may be silently ignored by browsers. Set to
     ``0`` to disable the warning.
 
+.. py:data:: JSON_ENSURE_ASCII
+
+    Controls whether the JSON serializer should replace non-ASCII characters with escape sequences.
+    When set to ``False``, the serializer will output Unicode characters as-is, resulting in more
+    compact and human-readable JSON outputs, especially for non-English languages. 
+    This can improve performance and reduce payload size.
+    
+    For security reasons, strings containing HTML tags like ``</script>`` will always 
+    be ASCII-escaped regardless of this setting.
+    
+    Default: ``False``
+
+.. py:data:: JSON_SORT_KEYS
+
+    Controls whether dictionary keys should be sorted alphabetically when serializing JSON.
+    When set to ``False``, keys are output in insertion order, which can improve 
+    serialization performance. When set to ``True``, outputs are consistent
+    between serializations, which can be useful for testing and caching.
+    
+    For backward compatibility, this defaults to ``True`` in debug mode unless
+    explicitly configured otherwise.
+    
+    Default: ``False``
+
 .. py:data:: PROVIDE_AUTOMATIC_OPTIONS
 
     Set to ``False`` to disable the automatic addition of OPTIONS
@@ -438,6 +462,11 @@ The following configuration values are used internally by Flask:
     ``JSON_AS_ASCII``, ``JSON_SORT_KEYS``, ``JSONIFY_MIMETYPE``, and
     ``JSONIFY_PRETTYPRINT_REGULAR`` were removed. The default ``app.json`` provider has
     equivalent attributes instead.
+
+.. versionadded:: 3.1
+    ``JSON_ENSURE_ASCII`` and ``JSON_SORT_KEYS`` were reintroduced to configure the 
+    default JSON serialization behavior. The JSON provider will use these settings 
+    when serializing JSON data.
 
 .. versionchanged:: 2.3
     ``ENV`` was removed.

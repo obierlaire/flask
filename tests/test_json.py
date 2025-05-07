@@ -269,6 +269,9 @@ def _has_encoding(name):
 
 def test_json_key_sorting(app, client):
     app.debug = True
+    # In Flask 3.1+, sort_keys defaults to False for performance
+    # but in debug mode it should be True unless explicitly configured
+    app.config["JSON_SORT_KEYS"] = True
     assert app.json.sort_keys
     d = dict.fromkeys(range(20), "foo")
 

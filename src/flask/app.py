@@ -206,6 +206,8 @@ class Flask(App):
             "TEMPLATES_AUTO_RELOAD": None,
             "MAX_COOKIE_SIZE": 4093,
             "PROVIDE_AUTOMATIC_OPTIONS": True,
+            "JSON_ENSURE_ASCII": False,
+            "JSON_SORT_KEYS": False,
         }
     )
 
